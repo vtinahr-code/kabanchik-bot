@@ -6,7 +6,7 @@ import os
 import re
 import time
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -42,10 +42,31 @@ HEADERS = {
 }
 TIMEOUT = 25
 
+# Якщо на сторінці є одна з цих фраз — замовлення вже не треба надсилати.
+CLOSED_MARKERS = (
+    "замовлення закрито",
+    "заказ закрыт",
+    "замовлення виконано",
+    "заказ выполнен",
+    "виконавець обраний",
+    "исполнитель выбран",
+    "замовлення скасовано",
+    "заказ отменен",
+    "завдання закрито",
+    "задание закрыто",
+    "завдання виконано",
+    "задание выполнено",
+    "архівне замовлення",
+    "архивный заказ",
+)
+
+session = requests.Session()
+session.headers.update(HEADERS)
+
 
 def telegram_send(text: str) -> None:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    response = requests.post(
+    response = session.post(
         url,
         json={
             "chat_id": CHAT_ID,
@@ -58,11 +79,20 @@ def telegram_send(text: str) -> None:
 
 
 def load_seen() -> set[str]:
+    """Сумісно зі старим seen.json, де зберігався просто список ID."""
     try:
-        return set(json.loads(STATE_FILE.read_text(encoding="utf-8")))
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return {str(x) for x in data}
+        if isinstance(data, dict):
+            # На випадок майбутнього розширення формату.
+            raw = data.get("seen", [])
+            return {str(x) for x in raw}
+        return set()
     except FileNotFoundError:
         return set()
-    except Exception:
+    except Exception as exc:
+        print(f"Не вдалося прочитати seen.json: {exc}", flush=True)
         return set()
 
 
@@ -83,77 +113,182 @@ def relevant(text: str) -> bool:
     return any(word in low for word in KEYWORDS)
 
 
-def fetch_tasks(page_url: str) -> list[dict]:
-    response = requests.get(page_url, headers=HEADERS, timeout=TIMEOUT)
+def canonical_task_url(base_url: str, href: str) -> str:
+    """Прибирає query/fragment, щоб одне замовлення не ставало різними ID."""
+    absolute = urljoin(base_url, href)
+    parts = urlsplit(absolute)
+    path = re.sub(r"/+$", "", parts.path)
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+def task_id_from_url(task_url: str) -> str:
+    """
+    Якщо в URL є числовий ID — використовуємо його.
+    Інакше fallback на стабільний hash канонічного URL.
+    """
+    match = re.search(r"/task/(?:[^/?#]*-)?(\d+)(?:/|$)", task_url)
+    if match:
+        return match.group(1)
+    return hashlib.sha256(task_url.encode("utf-8")).hexdigest()
+
+
+def fetch_candidate_urls(page_url: str) -> dict[str, str]:
+    """
+    На сторінці списку беремо ВСІ посилання на /task/.
+    Тут навмисно не фільтруємо за текстом — бо короткий заголовок у списку
+    може не містити слова 'бухгалтер', хоча воно є всередині замовлення.
+    """
+    response = session.get(page_url, timeout=TIMEOUT)
     response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
-    items: dict[str, dict] = {}
 
+    items: dict[str, str] = {}
     for anchor in soup.select('a[href*="/task/"]'):
         href = anchor.get("href")
         if not href:
             continue
 
-        task_url = urljoin(page_url, href).split("#")[0]
-        title = clean(anchor.get_text(" ", strip=True))
-        parent = anchor.find_parent(["article", "li", "div"])
-        context = clean(parent.get_text(" ", strip=True) if parent else title)
+        task_url = canonical_task_url(page_url, href)
+        task_id = task_id_from_url(task_url)
+        items[task_id] = task_url
 
-        if not title:
-            continue
-        if not relevant(f"{title} {context}"):
-            continue
+    return items
 
-        budget_match = re.search(r"(\d[\d\s]{1,8})\s*(грн|₴)", context, re.I)
-        budget = clean(budget_match.group(0)) if budget_match else "не вказано"
 
-        task_id = hashlib.sha256(task_url.encode("utf-8")).hexdigest()
-        items[task_id] = {
-            "id": task_id,
-            "title": title[:300],
-            "url": task_url,
-            "budget": budget,
-        }
+def parse_task(task_id: str, task_url: str) -> dict | None:
+    """
+    Відкриває САМЕ замовлення перед відправкою.
+    Це прибирає головну помилку старої версії: закрите завдання більше
+    не відправляється лише тому, що Kabanchik показав його у списку.
+    """
+    response = session.get(task_url, timeout=TIMEOUT, allow_redirects=True)
 
-    return list(items.values())
+    # Видалене/недоступне завдання.
+    if response.status_code in (404, 410):
+        return None
+    response.raise_for_status()
+
+    final_url = canonical_task_url(task_url, response.url)
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    # Беремо текст сторінки без script/style, щоб не ловити службові слова.
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    page_text = clean(soup.get_text(" ", strip=True))
+    page_low = page_text.lower()
+
+    # Відсікаємо тільки ЯВНО закриті/скасовані/виконані замовлення.
+    # Якщо кнопка змінила назву, нове активне замовлення через це не пропустимо.
+    closed_reason = next((m for m in CLOSED_MARKERS if m in page_low), None)
+    if closed_reason:
+        print(
+            f"Пропущено закрите замовлення {task_id}: {closed_reason} — {final_url}",
+            flush=True,
+        )
+        return None
+
+    # Заголовок краще брати зі сторінки завдання, а не з картки списку.
+    title = ""
+    h1 = soup.find("h1")
+    if h1:
+        title = clean(h1.get_text(" ", strip=True))
+
+    if not title:
+        meta = soup.find("meta", attrs={"property": "og:title"})
+        if meta and meta.get("content"):
+            title = clean(meta["content"])
+
+    if not title:
+        title = "Бухгалтерське замовлення"
+
+    # Ключові слова перевіряємо по ВСІЙ сторінці замовлення.
+    # Це важливо: старий бот перевіряв лише короткий блок у списку.
+    if not relevant(f"{title} {page_text}"):
+        print(f"Не бухгалтерське: {task_id} — {title}", flush=True)
+        return None
+
+    # Бюджет: спочатку шукаємо грн/₴ по сторінці.
+    budget_match = re.search(
+        r"(?<!\d)(\d[\d\s\u00a0]{0,9})(?:[.,]\d{1,2})?\s*(грн|₴)",
+        page_text,
+        re.I,
+    )
+    budget = clean(budget_match.group(0)) if budget_match else "не вказано"
+
+    return {
+        "id": task_id,
+        "title": title[:300],
+        "url": final_url,
+        "budget": budget,
+    }
 
 
 def cycle() -> None:
     seen = load_seen()
     first_run = not STATE_FILE.exists()
-    current: set[str] = set()
-    fresh: list[dict] = []
 
-    for url in TARGET_URLS:
+    current: dict[str, str] = {}
+
+    # 1) Збираємо кандидатів з усіх сторінок.
+    for page_url in TARGET_URLS:
         try:
-            for item in fetch_tasks(url):
-                current.add(item["id"])
-                if item["id"] not in seen:
-                    fresh.append(item)
+            current.update(fetch_candidate_urls(page_url))
         except Exception as exc:
-            print(f"Помилка перевірки {url}: {exc}", flush=True)
+            print(f"Помилка перевірки {page_url}: {exc}", flush=True)
 
     if first_run:
-        seen.update(current)
+        # На першому запуску нічого старого не шлемо.
+        seen.update(current.keys())
         save_seen(seen)
         telegram_send(
             "✅ Моніторинг Kabanchik запущено. Поточні оголошення запам’ятано. "
-            "Далі надсилатиму лише нові бухгалтерські замовлення."
+            "Далі надсилатиму лише нові активні бухгалтерські замовлення."
         )
-        print(f"Перший запуск: запам'ятано {len(current)} оголошень", flush=True)
+        print(
+            f"Перший запуск: запам'ятано {len(current)} посилань на замовлення",
+            flush=True,
+        )
         return
 
-    for item in fresh:
-        telegram_send(
-            "🧾 Нове замовлення на бухгалтерські послуги\n\n"
-            f"📌 {item['title']}\n"
-            f"💰 Бюджет: {item['budget']}\n"
-            f"🔗 {item['url']}"
-        )
+    new_ids = [task_id for task_id in current if task_id not in seen]
+    sent = 0
+    skipped = 0
 
-    seen.update(current)
+    # 2) Кожне НОВЕ посилання відкриваємо окремо і перевіряємо статус.
+    for task_id in new_ids:
+        task_url = current[task_id]
+        try:
+            item = parse_task(task_id, task_url)
+            if item is not None:
+                telegram_send(
+                    "🧾 Нове АКТИВНЕ замовлення на бухгалтерські послуги\n\n"
+                    f"📌 {item['title']}\n"
+                    f"💰 Бюджет: {item['budget']}\n"
+                    f"🔗 {item['url']}"
+                )
+                sent += 1
+            else:
+                skipped += 1
+        except Exception as exc:
+            # ВАЖЛИВО: якщо сторінка тимчасово не відкрилась —
+            # НЕ додаємо ID в seen. На наступному циклі бот спробує ще раз.
+            print(
+                f"Не вдалося перевірити нове замовлення {task_url}: {exc}",
+                flush=True,
+            )
+            continue
+
+        # Додаємо в seen тільки після успішної перевірки сторінки:
+        # активне — відправили; закрите/нерелевантне — свідомо пропустили.
+        seen.add(task_id)
+
     save_seen(seen)
-    print(f"Перевірено. Нових: {len(fresh)}", flush=True)
+    print(
+        f"Перевірено. Нових кандидатів: {len(new_ids)}, "
+        f"надіслано: {sent}, свідомо пропущено: {skipped}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
