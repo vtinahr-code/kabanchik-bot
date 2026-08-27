@@ -67,6 +67,11 @@ ACTION_MARKERS = (
     "откликнуться",
 )
 
+ACCOUNTING_CATEGORY_MARKERS = (
+    "бухгалтерські послуги",
+    "бухгалтерские услуги",
+)
+
 CLOSED_MARKERS = (
     "закрито замовником",
     "закрито автоматично",
@@ -241,6 +246,15 @@ def classify_task(page, task_id: int, url: str):
         )
 
     if active_reason:
+        # ВАЖЛИВО: надсилаємо ТІЛЬКИ завдання з категорії
+        # "Бухгалтерські послуги". Інші категорії (ремонт, монтаж тощо)
+        # відсікаються незалежно від тексту завдання.
+        category_ok = any(marker in low for marker in ACCOUNTING_CATEGORY_MARKERS)
+        if not category_ok:
+            print(f"[OTHER_CATEGORY] {task_id}", flush=True)
+            return "OTHER_CATEGORY", None
+
+        # Додаткова перевірка за бухгалтерськими ключовими словами.
         if not relevant(body):
             print(f"[NOT_RELEVANT] {task_id}", flush=True)
             return "NOT_RELEVANT", None
@@ -350,7 +364,7 @@ def cycle(browser) -> None:
                     seen.add(tid)
                     closed += 1
 
-                elif status == "NOT_RELEVANT":
+                elif status in ("NOT_RELEVANT", "OTHER_CATEGORY"):
                     seen.add(tid)
                     irrelevant += 1
 
@@ -393,9 +407,9 @@ def main() -> None:
         try:
             if first_start:
                 telegram_send(
-                    "✅ Kabanchik monitor v7 запущено. "
-                    "Тепер бот НЕ залежить від сторінки списку замовлень. "
-                    "Він перевіряє нові ID завдань напряму, тому охоплює всі міста України."
+                    "✅ Kabanchik monitor v8 запущено. "
+                    "Бот перевіряє нові ID напряму, але надсилає ТІЛЬКИ категорію «Бухгалтерські послуги». "
+                    "Охоплення — всі міста України."
                 )
 
             while True:
