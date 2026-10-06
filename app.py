@@ -1,427 +1,509 @@
-from __future__ import annotations
-
-import json
 import os
 import re
 import time
-from pathlib import Path
-from urllib.parse import urlsplit
-
+import json
+import html
 import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"].strip()
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
+# ============================================================
+# НАЛАШТУВАННЯ
+# ============================================================
 
-# Новий state-файл, щоб не тягнути помилки старих версій.
-STATE_FILE = Path(os.getenv("STATE_FILE_V7", "/data/state_v7.json"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-# Починаємо з відомого тобі активного замовлення.
-START_TASK_ID = int(os.getenv("START_TASK_ID_V7", "4955308"))
+if not BOT_TOKEN or not CHAT_ID:
+    raise RuntimeError("Не задані BOT_TOKEN або CHAT_ID у Railway Variables")
 
-# Скільки ID максимум перевіряємо за один цикл.
-MAX_PROBES_PER_CYCLE = int(os.getenv("MAX_PROBES_PER_CYCLE", "500"))
+BASE_URL = "https://kabanchik.ua/ua/task/{}"
 
-# Коли після останнього знайденого завдання бачимо стільки порожніх ID —
-# вважаємо, що наздогнали поточний кінець стрічки і чекаємо наступний цикл.
-MAX_CONSECUTIVE_MISSES = int(os.getenv("MAX_CONSECUTIVE_MISSES", "80"))
+POLL_SECONDS = 60
 
-HTTP_TIMEOUT = 12
-PAGE_TIMEOUT_MS = 30000
+# Скільки ID дивимося вперед від останнього відомого
+SCAN_AHEAD = 1500
+
+# Кількість паралельних запитів
+WORKERS = 20
+
+REQUEST_TIMEOUT = 12
+
+STATE_FILE = "state.json"
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/140.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.5",
+    "Accept-Language": "uk-UA,uk;q=0.9,ru;q=0.8,en;q=0.7",
 }
 
-# Бухгалтерські/суміжні ключові слова.
+# Слова, за якими нам цікаве замовлення
 KEYWORDS = [
-    x.strip().lower() for x in os.getenv(
-        "KEYWORDS_V7",
-        "бухгалтер,бухгалтерія,бухгалтерські,фоп,тов,пдв,єсв,звітність,"
-        "декларація,податкова,зарплата,кадри,1с,bas,m.e.doc,медок,"
-        "пенсійний фонд,пфу,декрет,декретна,допомога,"
-        "інвойс,invoice,commercial invoice,рахунок-фактура,рахунок фактура,"
-        "зед,експорт,імпорт,первинні документи,первинка,"
-        "відновлення обліку,ліквідаційна звітність"
-    ).split(",") if x.strip()
+    "бухгалтер",
+    "бухгалтерія",
+    "бухгалтерський",
+    "бухгалтерські",
+    "бухоблік",
+    "облік",
+    "податков",
+    "пдв",
+    "фоп",
+    "тов",
+    "звітність",
+    "звіт",
+    "деклараці",
+    "зарплат",
+    "кадров",
+    "1с",
+    "bas",
+    "медок",
+    "m.e.doc",
 ]
-
-ACTIVE_MARKERS = (
-    "очікує фахівця",
-    "ожидает специалиста",
-)
-
-ACTION_MARKERS = (
-    "виконати",
-    "відгукнутися",
-    "відгукнутись",
-    "подати пропозицію",
-    "додати пропозицію",
-    "запропонувати ціну",
-    "выполнить",
-    "откликнуться",
-)
-
-ACCOUNTING_CATEGORY_MARKERS = (
-    "бухгалтерські послуги",
-    "бухгалтерские услуги",
-)
-
-CLOSED_MARKERS = (
-    "закрито замовником",
-    "закрито автоматично",
-    "скасовано замовником",
-    "замовлення закрито",
-    "завдання закрито",
-    "заказ закрыт",
-    "замовлення скасовано",
-    "заказ отменен",
-    "виконавець обраний",
-    "исполнитель выбран",
-    "прострочено",
-)
 
 session = requests.Session()
 session.headers.update(HEADERS)
 
 
-def clean(value: str) -> str:
-    return re.sub(r"\s+", " ", value or "").strip()
+# ============================================================
+# ЛОГИ
+# ============================================================
 
-
-def telegram_send(text: str) -> None:
-    r = session.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={
-            "chat_id": CHAT_ID,
-            "text": text,
-            "disable_web_page_preview": False,
-        },
-        timeout=HTTP_TIMEOUT,
+def log(message):
+    print(
+        time.strftime("%Y-%m-%d %H:%M:%S"),
+        "|",
+        message,
+        flush=True
     )
-    r.raise_for_status()
 
 
-def load_state() -> dict:
+# ============================================================
+# STATE
+# ============================================================
+
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {
+            "last_valid_id": 0,
+            "sent_ids": []
+        }
+
     try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return {
-                "last_valid_id": int(data.get("last_valid_id", START_TASK_ID - 1)),
-                "seen": set(str(x) for x in data.get("seen", [])),
-            }
-    except FileNotFoundError:
-        pass
-    except Exception as exc:
-        print(f"[STATE READ ERROR] {exc}", flush=True)
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-    return {
-        "last_valid_id": START_TASK_ID - 1,
-        "seen": set(),
+        data.setdefault("last_valid_id", 0)
+        data.setdefault("sent_ids", [])
+
+        return data
+
+    except Exception as e:
+        log(f"STATE LOAD ERROR: {e}")
+
+        return {
+            "last_valid_id": 0,
+            "sent_ids": []
+        }
+
+
+def save_state(state):
+    try:
+        # Не даємо sent_ids рости безкінечно
+        state["sent_ids"] = state["sent_ids"][-5000:]
+
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(
+                state,
+                f,
+                ensure_ascii=False,
+                indent=2
+            )
+
+    except Exception as e:
+        log(f"STATE SAVE ERROR: {e}")
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+def send_telegram(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False,
     }
 
+    try:
+        r = requests.post(
+            url,
+            json=payload,
+            timeout=15
+        )
 
-def save_state(last_valid_id: int, seen: set[str]) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if r.ok:
+            return True
 
-    # Щоб файл не ріс безмежно, тримаємо останні 5000 ID.
-    sorted_seen = sorted((int(x) for x in seen if str(x).isdigit()))
-    sorted_seen = sorted_seen[-5000:]
+        log(
+            f"TELEGRAM ERROR "
+            f"{r.status_code}: {r.text[:300]}"
+        )
 
-    STATE_FILE.write_text(
-        json.dumps(
-            {
-                "last_valid_id": last_valid_id,
-                "seen": [str(x) for x in sorted_seen],
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    except Exception as e:
+        log(f"TELEGRAM EXCEPTION: {e}")
 
-
-def relevant(text: str) -> bool:
-    low = text.lower()
-    return any(keyword in low for keyword in KEYWORDS)
+    return False
 
 
-def numeric_task_url(task_id: int) -> str:
-    return f"https://kabanchik.ua/ua/task/{task_id}"
+# ============================================================
+# KABANCHIK
+# ============================================================
 
-
-def probe_task(task_id: int) -> tuple[bool, str | None]:
+def probe_task(task_id):
     """
-    Перевіряємо існування ID напряму, без списку /rabota/.
-    Якщо завдання існує, Kabanchik зазвичай повертає 200 або редірект на URL зі slug.
+    Перевіряє один ID.
+    Повертає:
+        None — замовлення не знайдено
+        dict — замовлення знайдено
     """
-    url = numeric_task_url(task_id)
+
+    url = BASE_URL.format(task_id)
 
     try:
         r = session.get(
             url,
-            timeout=HTTP_TIMEOUT,
-            allow_redirects=True,
-        )
-    except requests.RequestException as exc:
-        print(f"[PROBE ERROR] {task_id}: {exc}", flush=True)
-        return False, None
-
-    if r.status_code in (404, 410):
-        return False, None
-
-    if r.status_code >= 500:
-        print(f"[PROBE SERVER] {task_id}: HTTP {r.status_code}", flush=True)
-        return False, None
-
-    if r.status_code in (401, 403, 429):
-        # Не вважаємо ID відсутнім: сайт міг обмежити HTTP-запит.
-        # Playwright спробує відкрити його напряму.
-        return True, url
-
-    if r.status_code < 400:
-        final_url = r.url
-        # Якщо нас перекинуло на сторінку логіну/головну — це не task.
-        path = urlsplit(final_url).path
-        if "/task/" not in path:
-            return False, None
-        return True, final_url
-
-    return False, None
-
-
-def classify_task(page, task_id: int, url: str):
-    try:
-        response = page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=PAGE_TIMEOUT_MS,
-        )
-    except PlaywrightTimeoutError:
-        print(f"[PAGE TIMEOUT] {task_id}", flush=True)
-        return "RETRY", None
-
-    page.wait_for_timeout(1500)
-
-    if response is not None and response.status in (404, 410):
-        return "MISSING", None
-
-    try:
-        body = clean(page.locator("body").inner_text(timeout=10000))
-    except Exception as exc:
-        print(f"[BODY ERROR] {task_id}: {exc}", flush=True)
-        return "RETRY", None
-
-    low = body.lower()
-
-    # Якщо це реально не сторінка завдання.
-    if not body or ("сторінку не знайдено" in low) or ("page not found" in low):
-        return "MISSING", None
-
-    # Активність підтверджуємо статусом або реальною кнопкою.
-    active_reason = next((m for m in ACTIVE_MARKERS if m in low), None)
-
-    if not active_reason:
-        try:
-            action_texts = [
-                clean(x).lower()
-                for x in page.locator("a, button").all_inner_texts()
-            ]
-        except Exception:
-            action_texts = []
-
-        active_reason = next(
-            (
-                marker
-                for text in action_texts
-                for marker in ACTION_MARKERS
-                if marker in text
-            ),
-            None,
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=True
         )
 
-    if active_reason:
-        # ВАЖЛИВО: надсилаємо ТІЛЬКИ завдання з категорії
-        # "Бухгалтерські послуги". Інші категорії (ремонт, монтаж тощо)
-        # відсікаються незалежно від тексту завдання.
-        category_ok = any(marker in low for marker in ACCOUNTING_CATEGORY_MARKERS)
-        if not category_ok:
-            print(f"[OTHER_CATEGORY] {task_id}", flush=True)
-            return "OTHER_CATEGORY", None
+    except Exception as e:
+        log(f"REQUEST ERROR {task_id}: {e}")
+        return None
 
-        # Додаткова перевірка за бухгалтерськими ключовими словами.
-        if not relevant(body):
-            print(f"[NOT_RELEVANT] {task_id}", flush=True)
-            return "NOT_RELEVANT", None
+    if r.status_code != 200:
+        return None
 
-        title = ""
-        try:
-            if page.locator("h1").count():
-                title = clean(page.locator("h1").first.inner_text())
-        except Exception:
-            pass
+    final_url = r.url.lower()
 
-        if not title:
-            try:
-                title = clean(page.title())
-            except Exception:
-                title = ""
+    # Якщо Kabanchik перекинув не на сторінку task
+    if "/task/" not in final_url:
+        return None
 
-        if not title:
-            title = f"Замовлення №{task_id}"
+    soup = BeautifulSoup(r.text, "html.parser")
 
-        budget_match = re.search(
-            r"(?<!\d)(\d[\d\s\u00a0]{0,9})(?:[.,]\d{1,2})?\s*(грн|₴)",
-            body,
-            re.I,
+    title = ""
+
+    if soup.title:
+        title = soup.title.get_text(
+            " ",
+            strip=True
         )
-        budget = clean(budget_match.group(0)) if budget_match else "не вказано"
 
-        final_url = page.url
-        print(f"[ACTIVE] {task_id}: {title}", flush=True)
+    h1 = soup.find("h1")
 
-        return "ACTIVE", {
-            "id": task_id,
-            "title": title[:300],
-            "budget": budget,
-            "url": final_url,
-        }
+    if h1:
+        title = h1.get_text(
+            " ",
+            strip=True
+        ) or title
 
-    closed_reason = next((m for m in CLOSED_MARKERS if m in low), None)
-    if closed_reason:
-        print(f"[CLOSED] {task_id}: {closed_reason}", flush=True)
-        return "CLOSED", None
+    page_text = soup.get_text(
+        " ",
+        strip=True
+    )
 
-    print(f"[UNKNOWN] {task_id}: status/action not found", flush=True)
-    return "UNKNOWN", None
+    # Захист від сторінок 404 / видалених завдань
+    lower = page_text.lower()
+
+    bad_markers = [
+        "сторінку не знайдено",
+        "страница не найдена",
+        "завдання не знайдено",
+        "замовлення не знайдено",
+        "404",
+    ]
+
+    if any(marker in lower for marker in bad_markers):
+        return None
+
+    # Реальна сторінка завдання повинна мати хоч якийсь зміст
+    if len(page_text) < 150:
+        return None
+
+    return {
+        "id": task_id,
+        "url": url,
+        "title": title,
+        "text": page_text,
+    }
 
 
-def cycle(browser) -> None:
-    state = load_state()
-    last_valid_id = state["last_valid_id"]
-    seen = state["seen"]
+# ============================================================
+# ФІЛЬТР БУХГАЛТЕРСЬКИХ ЗАМОВЛЕНЬ
+# ============================================================
 
-    start_id = last_valid_id + 1
-    probe_id = start_id
+def is_accounting_task(task):
+    text = (
+        task.get("title", "")
+        + " "
+        + task.get("text", "")
+    ).lower()
 
-    consecutive_misses = 0
-    probes = 0
-    found_valid = 0
-    sent = 0
-    closed = 0
-    irrelevant = 0
-    unknown = 0
-    retry = 0
-
-    page = browser.new_page()
-
-    try:
-        while (
-            probes < MAX_PROBES_PER_CYCLE
-            and consecutive_misses < MAX_CONSECUTIVE_MISSES
-        ):
-            probes += 1
-
-            exists, resolved_url = probe_task(probe_id)
-
-            if not exists:
-                consecutive_misses += 1
-                probe_id += 1
-                continue
-
-            consecutive_misses = 0
-            found_valid += 1
-
-            # Знайдений реальний ID стає новою "верхньою межею".
-            if probe_id > last_valid_id:
-                last_valid_id = probe_id
-
-            tid = str(probe_id)
-
-            if tid not in seen:
-                status, item = classify_task(
-                    page,
-                    probe_id,
-                    resolved_url or numeric_task_url(probe_id),
-                )
-
-                if status == "ACTIVE" and item:
-                    telegram_send(
-                        "🧾 Нове АКТИВНЕ замовлення\n\n"
-                        f"📌 {item['title']}\n"
-                        f"💰 Бюджет: {item['budget']}\n"
-                        f"🔗 {item['url']}"
-                    )
-                    seen.add(tid)
-                    sent += 1
-
-                elif status == "CLOSED":
-                    seen.add(tid)
-                    closed += 1
-
-                elif status in ("NOT_RELEVANT", "OTHER_CATEGORY"):
-                    seen.add(tid)
-                    irrelevant += 1
-
-                elif status == "MISSING":
-                    # HTTP-проба могла дати хибнопозитивний результат.
-                    pass
-
-                elif status == "UNKNOWN":
-                    # Не запам'ятовуємо: наступного циклу перевіримо знову.
-                    unknown += 1
-
-                elif status == "RETRY":
-                    retry += 1
-
-            probe_id += 1
-
-    finally:
-        page.close()
-
-    save_state(last_valid_id, seen)
-
-    print(
-        f"[SUMMARY] start={start_id} last_valid={last_valid_id} "
-        f"probes={probes} valid={found_valid} sent={sent} "
-        f"closed={closed} irrelevant={irrelevant} "
-        f"unknown={unknown} retry={retry} misses={consecutive_misses}",
-        flush=True,
+    return any(
+        keyword in text
+        for keyword in KEYWORDS
     )
 
 
-def main() -> None:
-    first_start = not STATE_FILE.exists()
+def clean_title(title):
+    title = re.sub(
+        r"\s+",
+        " ",
+        title or ""
+    ).strip()
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+    return title[:300]
+
+
+# ============================================================
+# ОБРОБКА ЗНАЙДЕНОГО ЗАМОВЛЕННЯ
+# ============================================================
+
+def process_task(task, state):
+    task_id = task["id"]
+
+    if task_id in state["sent_ids"]:
+        return
+
+    if not is_accounting_task(task):
+        log(
+            f"SKIP {task_id}: "
+            f"не бухгалтерське"
+        )
+        return
+
+    title = clean_title(task["title"])
+
+    log(
+        f"NEW ACCOUNTING TASK: "
+        f"{task_id} | {title}"
+    )
+
+    message = (
+        "🔥 <b>Нове замовлення на Kabanchik</b>\n\n"
+        f"<b>{html.escape(title)}</b>\n\n"
+        f"🆔 {task_id}\n"
+        f"🔗 {task['url']}"
+    )
+
+    if send_telegram(message):
+        state["sent_ids"].append(task_id)
+
+        save_state(state)
+
+        log(f"SENT {task_id}")
+
+    else:
+        log(
+            f"NOT SENT {task_id}: "
+            f"Telegram error"
         )
 
-        try:
-            if first_start:
-                telegram_send(
-                    "✅ Kabanchik monitor v8 запущено. "
-                    "Бот перевіряє нові ID напряму, але надсилає ТІЛЬКИ категорію «Бухгалтерські послуги». "
-                    "Охоплення — всі міста України."
+
+# ============================================================
+# ПОШУК СТАРТОВОГО ID
+# ============================================================
+
+def find_start_id():
+    """
+    Якщо state.json ще немає, пробуємо знайти приблизно
+    актуальний ID.
+
+    Значення можна також задати вручну через Railway:
+    START_ID
+    """
+
+    env_start = os.getenv(
+        "START_ID",
+        ""
+    ).strip()
+
+    if env_start.isdigit():
+        return int(env_start)
+
+    # Безпечний fallback.
+    # Якщо бот уже працював раніше, state.json повинен містити ID.
+    return 0
+
+
+# ============================================================
+# ОДИН ЦИКЛ СКАНУВАННЯ
+# ============================================================
+
+def scan_cycle(state):
+
+    last_valid_id = int(
+        state.get(
+            "last_valid_id",
+            0
+        )
+    )
+
+    if last_valid_id <= 0:
+        last_valid_id = find_start_id()
+
+    if last_valid_id <= 0:
+        log(
+            "ERROR: немає last_valid_id. "
+            "Задай START_ID у Railway Variables."
+        )
+
+        return
+
+    start_id = last_valid_id + 1
+    end_id = last_valid_id + SCAN_AHEAD
+
+    log(
+        f"SCAN START: "
+        f"{start_id} → {end_id}"
+    )
+
+    ids = range(
+        start_id,
+        end_id + 1
+    )
+
+    found_tasks = []
+
+    with ThreadPoolExecutor(
+        max_workers=WORKERS
+    ) as executor:
+
+        futures = {
+            executor.submit(
+                probe_task,
+                task_id
+            ): task_id
+
+            for task_id in ids
+        }
+
+        for future in as_completed(futures):
+
+            task_id = futures[future]
+
+            try:
+                task = future.result()
+
+            except Exception as e:
+                log(
+                    f"WORKER ERROR "
+                    f"{task_id}: {e}"
                 )
+                continue
 
-            while True:
-                try:
-                    cycle(browser)
-                except Exception as exc:
-                    print(f"[CRITICAL] {exc}", flush=True)
+            if task:
+                found_tasks.append(task)
 
-                time.sleep(POLL_SECONDS)
+    found_tasks.sort(
+        key=lambda x: x["id"]
+    )
 
-        finally:
-            browser.close()
+    log(
+        f"SCAN RESULT: "
+        f"знайдено {len(found_tasks)} "
+        f"реальних замовлень"
+    )
+
+    if found_tasks:
+
+        highest_valid_id = max(
+            task["id"]
+            for task in found_tasks
+        )
+
+        for task in found_tasks:
+            process_task(
+                task,
+                state
+            )
+
+        if highest_valid_id > state["last_valid_id"]:
+            state["last_valid_id"] = highest_valid_id
+
+            save_state(state)
+
+            log(
+                f"LAST VALID ID: "
+                f"{highest_valid_id}"
+            )
+
+    else:
+        log(
+            "У цьому діапазоні "
+            "замовлень не знайдено. "
+            "Наступного циклу перевіряємо знову."
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    log("===================================")
+    log("KABANCHIK BOT STARTED")
+    log(f"POLL_SECONDS = {POLL_SECONDS}")
+    log(f"SCAN_AHEAD = {SCAN_AHEAD}")
+    log(f"WORKERS = {WORKERS}")
+    log("===================================")
+
+    state = load_state()
+
+    log(
+        f"STATE: last_valid_id="
+        f"{state.get('last_valid_id')}, "
+        f"sent={len(state.get('sent_ids', []))}"
+    )
+
+    # Повідомлення після кожного нового deployment
+    send_telegram(
+        "🟢 <b>Kabanchik bot запущений</b>\n"
+        "Моніторинг бухгалтерських замовлень працює."
+    )
+
+    while True:
+
+        cycle_started = time.time()
+
+        try:
+            scan_cycle(state)
+
+        except Exception as e:
+            log(
+                f"CYCLE FATAL ERROR: {repr(e)}"
+            )
+
+        elapsed = round(
+            time.time() - cycle_started,
+            1
+        )
+
+        log(
+            f"CYCLE FINISHED: "
+            f"{elapsed} sec. "
+            f"Наступна перевірка через "
+            f"{POLL_SECONDS} sec."
+        )
+
+        time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
