@@ -1,635 +1,100 @@
 from __future__ import annotations
-
-import html
-import json
-import os
-import re
-import time
+import os, re, time, json, html, logging
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from urllib.parse import urljoin, urlparse
 import requests
+from bs4 import BeautifulSoup
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+log = logging.getLogger('kabanchik')
+TOKEN = os.environ['TELEGRAM_BOT_TOKEN'].strip()
+CHAT = os.environ['TELEGRAM_CHAT_ID'].strip()
+URL = os.getenv('KABANCHIK_LIST_URL','https://kabanchik.ua/ua/cabinet/dashboard/p/recommended')
+COOKIE = os.getenv('KABANCHIK_COOKIE','').strip()
+INTERVAL = max(30, int(os.getenv('POLL_SECONDS','60')))
+STATE = Path(os.getenv('STATE_FILE','/data/kabanchik_seen.json'))
+BASE = 'https://kabanchik.ua'
+HEADERS = {'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0 Safari/537.36','Accept-Language':'uk-UA,uk;q=0.9,ru;q=0.8'}
+# Only accounting services, not generic marketing/legal/business tasks.
+ACCOUNTING = re.compile(r'бухгалтер|бухгалтерск|облік|уч[её]т|звітн|отч[её]тност|податков|налогов|єсв|ндфл|пдв|ндс|фоп|фопа|фопів|флп|1с|bas\b|медок|m\.e\.doc', re.I)
+CLOSED = re.compile(r'закрит[оаий]|виконан[оий]|завершен[оий]|закрыт|выполнен|завершен',re.I)
+TASK_PATH = re.compile(r'/((?:ua|ru)/)?task/\d+(?:[/?#]|$)',re.I)
 
-# ============================================================
-# RAILWAY / TELEGRAM
-# ============================================================
+session = requests.Session(); session.headers.update(HEADERS)
+if COOKIE: session.headers['Cookie'] = COOKIE
 
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"].strip()
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
-
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
-REQUEST_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "12"))
-WORKERS = int(os.getenv("WORKERS", "10"))
-
-STATE_FILE = Path(
-    os.getenv("STATE_FILE_V7", "/data/state_v7.json")
-)
-
-START_TASK_ID = int(
-    os.getenv("START_TASK_ID_V7", "4997000")
-)
-
-SCAN_AHEAD = int(
-    os.getenv("SCAN_AHEAD", "500")
-)
-
-BASE_TASK_URL = "https://kabanchik.ua/ua/task/{}"
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/140.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml",
-    "Accept-Language": "uk-UA,uk;q=0.9,ru;q=0.8,en;q=0.7",
-}
-
-
-# ============================================================
-# БУХГАЛТЕРСЬКІ ВИДИ ПОСЛУГ
-#
-# Перевіряємо ТІЛЬКИ основний блок конкретного замовлення.
-# Заголовок замовника може бути українською або російською —
-# це не має значення.
-# ============================================================
-
-ACCOUNTING_SERVICE_MARKERS = (
-    # українські
-    "складання фінансової звітності",
-    "ведення бухгалтерського обліку",
-    "бухгалтерські послуги",
-    "послуги бухгалтера",
-    "консультація бухгалтера",
-    "консультації бухгалтера",
-    "бухгалтерська консультація",
-    "відновлення бухгалтерського обліку",
-    "постановка бухгалтерського обліку",
-    "податкова звітність",
-    "бухгалтерська звітність",
-    "складання податкової звітності",
-    "реєстрація податкових накладних",
-    "бухгалтерський супровід",
-    "ведення фоп",
-    "звітність фоп",
-    "аудит бухгалтерського обліку",
-
-    # російські
-    "составление финансовой отчетности",
-    "ведение бухгалтерского учета",
-    "бухгалтерские услуги",
-    "услуги бухгалтера",
-    "консультация бухгалтера",
-    "консультации бухгалтера",
-    "бухгалтерская консультация",
-    "восстановление бухгалтерского учета",
-    "постановка бухгалтерского учета",
-    "налоговая отчетность",
-    "бухгалтерская отчетность",
-    "составление налоговой отчетности",
-    "регистрация налоговых накладных",
-    "бухгалтерское сопровождение",
-    "ведение фоп",
-    "отчетность фоп",
-)
-
-
-def log(message):
-    print(
-        time.strftime("%Y-%m-%d %H:%M:%S"),
-        "|",
-        message,
-        flush=True
-    )
-
-
-# ============================================================
-# STATE
-# ============================================================
-
-def default_state():
-    return {
-        "last_scan_id": START_TASK_ID,
-        "sent_ids": []
-    }
-
-
-def load_state():
-    try:
-        if not STATE_FILE.exists():
-            log(f"NEW STATE | START={START_TASK_ID}")
-            return default_state()
-
-        with STATE_FILE.open("r", encoding="utf-8") as f:
-            state = json.load(f)
-
-        if "last_scan_id" not in state:
-            state["last_scan_id"] = int(
-                state.get("last_valid_id")
-                or state.get("last_task_id")
-                or START_TASK_ID
-            )
-
-        state.setdefault("sent_ids", [])
-
-        state["sent_ids"] = [
-            int(x) for x in state["sent_ids"]
-            if str(x).isdigit()
-        ]
-
-        return state
-
-    except Exception as exc:
-        log(f"STATE LOAD ERROR: {repr(exc)}")
-        return default_state()
-
-
-def save_state(state):
-    try:
-        STATE_FILE.parent.mkdir(
-            parents=True,
-            exist_ok=True
-        )
-
-        state["sent_ids"] = state["sent_ids"][-10000:]
-
-        temp = STATE_FILE.with_suffix(".tmp")
-
-        with temp.open("w", encoding="utf-8") as f:
-            json.dump(
-                state,
-                f,
-                ensure_ascii=False,
-                indent=2
-            )
-
-        temp.replace(STATE_FILE)
-
-    except Exception as exc:
-        log(f"STATE SAVE ERROR: {repr(exc)}")
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-def send_telegram(message):
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{BOT_TOKEN}/sendMessage"
-    )
-
-    while True:
+def telegram(text):
+    for attempt in range(3):
         try:
-            response = requests.post(
-                url,
-                data={
-                    "chat_id": CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": False,
-                },
-                timeout=15
-            )
-
-            if response.ok:
-                return True
-
-            # Telegram тимчасово блокує після великої
-            # кількості повідомлень.
-            if response.status_code == 429:
-                try:
-                    data = response.json()
-
-                    retry_after = int(
-                        data.get(
-                            "parameters", {}
-                        ).get(
-                            "retry_after", 60
-                        )
-                    )
-
-                except Exception:
-                    retry_after = 60
-
-                log(
-                    f"TELEGRAM RATE LIMIT | "
-                    f"WAIT {retry_after}s"
-                )
-
-                time.sleep(retry_after + 2)
-
-                # Повторюємо САМЕ це повідомлення.
-                continue
-
-            log(
-                f"TELEGRAM ERROR "
-                f"{response.status_code}"
-            )
-
-            return False
-
-        except Exception as exc:
-            log(
-                f"TELEGRAM EXCEPTION: "
-                f"{repr(exc)}"
-            )
-
-            return False
-
-
-# ============================================================
-# HTML
-# ============================================================
-
-def html_to_lines(source):
-    source = re.sub(
-        r"(?is)<script.*?>.*?</script>",
-        " ",
-        source
-    )
-
-    source = re.sub(
-        r"(?is)<style.*?>.*?</style>",
-        " ",
-        source
-    )
-
-    source = re.sub(
-        r"(?s)<[^>]+>",
-        "\n",
-        source
-    )
-
-    source = html.unescape(source)
-
-    result = []
-
-    for line in source.splitlines():
-        line = re.sub(
-            r"\s+",
-            " ",
-            line
-        ).strip()
-
-        if line:
-            result.append(line)
-
-    return result
-
-
-def extract_title(source):
-    match = re.search(
-        r"(?is)<h1[^>]*>(.*?)</h1>",
-        source
-    )
-
-    if match:
-        title = re.sub(
-            r"<[^>]+>",
-            " ",
-            match.group(1)
-        )
-
-        title = html.unescape(title)
-
-        return re.sub(
-            r"\s+",
-            " ",
-            title
-        ).strip()
-
-    match = re.search(
-        r"(?is)<title[^>]*>(.*?)</title>",
-        source
-    )
-
-    if match:
-        title = html.unescape(
-            match.group(1)
-        )
-
-        return re.sub(
-            r"\s+",
-            " ",
-            title
-        ).strip()
-
-    return "Нове замовлення"
-
-
-# ============================================================
-# ОСНОВНИЙ БЛОК ЗАМОВЛЕННЯ
-#
-# ВСЕ після "Інші замовлення у категорії"
-# НЕ перевіряємо.
-# ============================================================
-
-def get_main_task_lines(lines):
-    result = []
-
-    for line in lines:
-        normalized = line.lower()
-
-        if "інші замовлення у категорії" in normalized:
-            break
-
-        if "другие заказы в категории" in normalized:
-            break
-
-        result.append(line)
-
-    return result
-
-
-# ============================================================
-# ВЕРХНЯ КАТЕГОРІЯ KABANCHIK
-# ============================================================
-
-def get_parent_category(lines):
-    for line in lines:
-        normalized = line.lower()
-
-        if (
-            "хочете виконувати замовлення у категорії"
-            in normalized
-        ):
-            return line
-
-        if (
-            "хотите выполнять заказы в категории"
-            in normalized
-        ):
-            return line
-
-    return ""
-
-
-# ============================================================
-# БУХГАЛТЕРСЬКИЙ ФІЛЬТР
-# ============================================================
-
-def detect_accounting_service(lines):
-    # Перша страховка:
-    # замовлення повинно бути хоча б у "Ділових послугах".
-    parent_category = get_parent_category(lines).lower()
-
-    if parent_category:
-        business_parent = (
-            "ділові послуги" in parent_category
-            or
-            "деловые услуги" in parent_category
-        )
-
-        if not business_parent:
-            return None
-
-    # Друга, головна перевірка:
-    # дивимось ТІЛЬКИ на основний блок
-    # конкретного замовлення.
-    main_lines = get_main_task_lines(lines)
-
-    # На сторінках Kabanchik тип послуги знаходиться
-    # окремим рядком перед описом замовлення.
-    #
-    # Перевіряємо окремі рядки, а НЕ весь HTML.
-    for line in main_lines:
-        normalized = line.lower().strip()
-
-        for marker in ACCOUNTING_SERVICE_MARKERS:
-            if (
-                normalized == marker
-                or normalized.startswith(marker + ":")
-            ):
-                return line
-
-    return None
-
-
-# ============================================================
-# TASK
-# ============================================================
-
-def probe_task(task_id):
-    url = BASE_TASK_URL.format(task_id)
-
-    try:
-        response = requests.get(
-            url,
-            headers=HEADERS,
-            timeout=REQUEST_TIMEOUT,
-            allow_redirects=True
-        )
-
-    except requests.RequestException:
-        return None
-
-    if response.status_code != 200:
-        return None
-
-    if "/task/" not in response.url:
-        return None
-
-    lines = html_to_lines(
-        response.text
-    )
-
-    if len(lines) < 10:
-        return None
-
-    first_part = " ".join(
-        lines[:50]
-    ).lower()
-
-    not_found = (
-        "сторінку не знайдено",
-        "сторінка не знайдена",
-        "страница не найдена",
-        "завдання не знайдено",
-        "page not found",
-    )
-
-    if any(
-        marker in first_part
-        for marker in not_found
-    ):
-        return None
-
-    title = extract_title(
-        response.text
-    )
-
-    service = detect_accounting_service(
-        lines
-    )
-
-    return {
-        "id": task_id,
-        "url": response.url,
-        "title": title,
-        "service": service,
-    }
-
-
-# ============================================================
-# PROCESS
-# ============================================================
-
-def process_task(task, state):
-    task_id = int(task["id"])
-
-    if task_id in state["sent_ids"]:
-        return
-
-    # НЕ бухгалтерське —
-    # просто мовчимо.
-    # Ніяких тисяч SKIP у Railway.
-    if not task["service"]:
-        return
-
-    title = task["title"]
-    service = task["service"]
-
-    log(
-        f"ACCOUNTING FOUND | "
-        f"{task_id} | "
-        f"{service}"
-    )
-
-    message = (
-        "🔥 <b>Нове замовлення — "
-        "Бухгалтерські послуги</b>\n\n"
-        f"<b>{html.escape(title)}</b>\n\n"
-        f"📂 {html.escape(service)}\n"
-        f"🆔 {task_id}\n\n"
-        f"🔗 {html.escape(task['url'])}"
-    )
-
-    if send_telegram(message):
-        state["sent_ids"].append(
-            task_id
-        )
-
-        save_state(state)
-
-        log(
-            f"SENT TO TELEGRAM | "
-            f"{task_id}"
-        )
-
-
-# ============================================================
-# SCAN
-# ============================================================
-
-def scan_cycle(state):
-    current = int(
-        state.get(
-            "last_scan_id",
-            START_TASK_ID
-        )
-    )
-
-    first_id = current + 1
-    last_id = current + SCAN_AHEAD
-
-    log(
-        f"SCAN | "
-        f"{first_id}-{last_id}"
-    )
-
-    found = []
-
-    with ThreadPoolExecutor(
-        max_workers=WORKERS
-    ) as executor:
-
-        futures = {
-            executor.submit(
-                probe_task,
-                task_id
-            ): task_id
-
-            for task_id in range(
-                first_id,
-                last_id + 1
-            )
-        }
-
-        for future in as_completed(
-            futures
-        ):
-            try:
-                task = future.result()
-
-                if task:
-                    found.append(task)
-
-            except Exception:
-                pass
-
-    found.sort(
-        key=lambda item: item["id"]
-    )
-
-    accounting_count = 0
-
-    for task in found:
-        if task["service"]:
-            accounting_count += 1
-
-        process_task(
-            task,
-            state
-        )
-
-    state["last_scan_id"] = last_id
-
-    save_state(state)
-
-    log(
-        f"SCAN DONE | "
-        f"existing={len(found)} | "
-        f"accounting={accounting_count}"
-    )
-
-
-# ============================================================
-# MAIN
-# ============================================================
+            r = requests.post(f'https://api.telegram.org/bot{TOKEN}/sendMessage',json={'chat_id':CHAT,'text':text,'parse_mode':'HTML','disable_web_page_preview':True},timeout=15)
+            if r.status_code == 429:
+                time.sleep(min(90,int(r.json().get('parameters',{}).get('retry_after',15))+1)); continue
+            r.raise_for_status(); return True
+        except Exception as e:
+            log.error('Telegram send failed: %s',e)
+            time.sleep(2)
+    return False
+
+def load_seen():
+    try: return set(json.loads(STATE.read_text(encoding='utf-8')))
+    except (OSError,ValueError): return set()
+
+def save_seen(seen):
+    STATE.parent.mkdir(parents=True,exist_ok=True)
+    temp=STATE.with_suffix('.tmp')
+    temp.write_text(json.dumps(sorted(seen)[-20000:],ensure_ascii=False),encoding='utf-8')
+    temp.replace(STATE)
+
+def fetch_tasks():
+    r=session.get(URL,timeout=20,allow_redirects=True)
+    log.info('SOURCE HTTP=%s final_url=%s bytes=%s',r.status_code,r.url,len(r.content))
+    r.raise_for_status()
+    if '/auth/' in urlparse(r.url).path or '/login' in urlparse(r.url).path:
+        raise RuntimeError('Kabanchik redirected to login. Session authentication is required.')
+    soup=BeautifulSoup(r.text,'html.parser')
+    # Pages that load orders only through JavaScript will not yield task links here.
+    results={}
+    for a in soup.select('a[href]'):
+        href=urljoin(r.url,a.get('href',''))
+        if urlparse(href).netloc not in ('kabanchik.ua','www.kabanchik.ua') or not TASK_PATH.search(urlparse(href).path): continue
+        key=re.search(r'/task/(\d+)',urlparse(href).path)
+        if not key: continue
+        task_id=key.group(1)
+        container=a.find_parent(['article','li']) or a.find_parent(class_=re.compile('task|order|item|card',re.I)) or a
+        title=a.get_text(' ',strip=True) or container.get_text(' ',strip=True)[:120]
+        text=container.get_text(' ',strip=True)[:1500]
+        if not ACCOUNTING.search(text): continue
+        if CLOSED.search(text): continue
+        results[task_id]={'id':task_id,'url':href,'title':title[:180] or 'Бухгалтерське замовлення'}
+    return list(results.values())
 
 def main():
-    log(
-        "KABANCHIK BOT STARTED | "
-        "ACCOUNTING ONLY"
-    )
-
-    state = load_state()
-
-    log(
-        f"START POSITION | "
-        f"{state['last_scan_id']}"
-    )
-
-    # Не шлемо стартове повідомлення в Telegram.
-    # Telegram — тільки для реальних
-    # бухгалтерських замовлень.
-
+    seen=load_seen()
+    log.info('START | url=%s | cookie_provided=%s | previously_seen=%s',URL,bool(COOKIE),len(seen))
+    telegram('🤖 <b>Бот Kabanchik запущено.</b> Перевіряю бухгалтерські замовлення. Це тестове повідомлення, не нове замовлення.')
+    errors=0; last_alert=0
     while True:
         try:
-            scan_cycle(state)
+            tasks=fetch_tasks()
+            log.info('SCAN DONE | matching=%s | seen=%s',len(tasks),len(seen))
+            # On first successful scan, baseline current results to avoid old notifications.
+            if not STATE.exists():
+                seen.update(t['id'] for t in tasks); save_seen(seen)
+                log.info('INITIAL BASELINE | %s tasks; notifications start with next new task',len(tasks))
+            else:
+                for task in tasks:
+                    if task['id'] in seen: continue
+                    message='📣 <b>Нове бухгалтерське замовлення</b>\n\n<b>'+html.escape(task['title'])+'</b>\n'+html.escape(task['url'])
+                    if telegram(message):
+                        seen.add(task['id']); save_seen(seen)
+                        log.info('SENT | task=%s',task['id'])
+            errors=0
+        except Exception as e:
+            errors+=1
+            log.exception('SCAN ERROR | consecutive=%s | %s',errors,e)
+            if errors>=3 and time.time()-last_alert>3600:
+                telegram('⚠️ <b>Kabanchik: помилка сканування</b>\n'+html.escape(str(e)[:300])+'\nПеревір Railway Logs.')
+                last_alert=time.time()
+        time.sleep(INTERVAL)
 
-        except Exception as exc:
-            log(
-                f"CYCLE ERROR: "
-                f"{repr(exc)}"
-            )
-
-        time.sleep(
-            POLL_SECONDS
-        )
-
-
-if __name__ == "__main__":
-    main()
+if __name__=='__main__': main()
